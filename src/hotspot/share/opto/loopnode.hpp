@@ -1344,6 +1344,9 @@ SHENANDOAHGC_ONLY(public:)
   bool identical_backtoback_ifs(Node *n);
   bool can_split_if(Node *n_ctrl);
 SHENANDOAHGC_ONLY(private:)
+  bool cannot_split_division(const Node* n, const Node* region) const;
+  static bool is_divisor_counted_loop_phi(const Node* divisor, const Node* loop);
+  bool loop_phi_backedge_type_contains_zero(const Node* phi_divisor, const Type* zero) const;
 
   // Clone loop predicates to slow and fast loop when unswitching a loop
   void clone_predicates_to_unswitched_loop(IdealLoopTree* loop, const Node_List& old_new, ProjNode*& iffast_pred, ProjNode*& ifslow_pred);
@@ -1429,10 +1432,8 @@ SHENANDOAHGC_ONLY(private:)
   }
 
   bool _created_loop_node;
-#ifdef ASSERT
-  void dump_real_LCA(Node* early, Node* wrong_lca);
-  bool check_idom_chains_intersection(const Node* n, uint& idom_idx_new, uint& idom_idx_other, const Node_List* nodes_seen) const;
-#endif
+  DEBUG_ONLY(void dump_idoms(Node* early, Node* wrong_lca);)
+  NOT_PRODUCT(void dump_idoms_in_reverse(const Node* n, const Node_List& idom_list) const;)
 
 public:
   void set_created_loop_node() { _created_loop_node = true; }
@@ -1445,7 +1446,9 @@ public:
 
 #ifndef PRODUCT
   void dump() const;
-  void dump_idom(Node* n) const;
+  void dump_idom(Node* n) const { dump_idom(n, 1000); } // For debugging
+  void dump_idom(Node* n, uint count) const;
+  void get_idoms(Node* n, uint count, Unique_Node_List& idoms) const;
   void dump(IdealLoopTree* loop, uint rpo_idx, Node_List &rpo_list) const;
   void verify() const;          // Major slow  :-)
   void verify_compare(Node* n, const PhaseIdealLoop* loop_verify, VectorSet &visited) const;
