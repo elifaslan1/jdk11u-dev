@@ -82,10 +82,6 @@ inline size_t os::restartable_read(int fd, void *buf, unsigned int nBytes) {
   return ::read(fd, buf, nBytes);
 }
 
-inline size_t os::write(int fd, const void *buf, unsigned int nBytes) {
-  return ::write(fd, buf, nBytes);
-}
-
 inline int os::close(int fd) {
   return ::close(fd);
 }
