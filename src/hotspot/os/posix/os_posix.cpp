@@ -586,6 +586,12 @@ FILE* os::open(int fd, const char* mode) {
   return ::fdopen(fd, mode);
 }
 
+ssize_t os::pd_write(int fd, const void *buf, size_t nBytes) {
+  ssize_t res;
+  RESTARTABLE(::write(fd, buf, nBytes), res);
+  return res;
+}
+
 void os::flockfile(FILE* fp) {
   ::flockfile(fp);
 }
