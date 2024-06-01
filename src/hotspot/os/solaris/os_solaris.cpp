@@ -5348,11 +5348,6 @@ int os::fork_and_exec(char* cmd, bool use_vfork_if_available) {
   }
 }
 
-size_t os::write(int fd, const void *buf, unsigned int nBytes) {
-  size_t res;
-  RESTARTABLE((size_t) ::write(fd, buf, (size_t) nBytes), res);
-  return res;
-}
 
 int os::close(int fd) {
   return ::close(fd);

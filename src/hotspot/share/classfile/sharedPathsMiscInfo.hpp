@@ -128,7 +128,7 @@ public:
 
   bool dump_to_file(int fd) {
     int n = get_used_bytes();
-    return (os::write(fd, _buf_start, n) == (size_t)n);
+    return (os::write(fd, _buf_start, n));
   }
 
   // reading --

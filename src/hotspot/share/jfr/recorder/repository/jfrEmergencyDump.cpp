@@ -238,8 +238,13 @@ static void write_emergency_file(fio_fd emergency_fd, const RepositoryIterator& 
           }
           bytes_read += (int64_t)read_result;
           assert(bytes_read - bytes_written <= (int64_t)size_of_file_copy_block, "invariant");
-          bytes_written += (int64_t)os::write(emergency_fd, file_copy_block, bytes_read - bytes_written);
-          assert(bytes_read == bytes_written, "invariant");
+          if (!os::write(emergency_fd, file_copy_block, bytes_read - bytes_written)) {
+           log_info(jfr)( // For user, should not be "jfr, system"
+              "Unable to recover JFR data, write failed.");
+            break;
+        }
+        bytes_written = bytes_read;
+
         }
         os::close(current_fd);
       }
