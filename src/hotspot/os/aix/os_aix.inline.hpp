@@ -28,23 +28,6 @@
 
 #include "runtime/os.hpp"
 
-// System includes
-
-#include <unistd.h>
-#include <sys/socket.h>
-#include <poll.h>
-#include <sys/ioctl.h>
-#include <netdb.h>
-
-// File names are case-insensitive on windows only.
-inline int os::file_name_strncmp(const char* s1, const char* s2, size_t num) {
-  return strncmp(s1, s2, num);
-}
-
-inline bool os::obsolete_option(const JavaVMOption *option) {
-  return false;
-}
-
 inline bool os::uses_stack_guard_pages() {
   return true;
 }
@@ -68,75 +51,4 @@ inline void os::pd_split_reserved_memory(char *base, size_t size,
 inline void os::map_stack_shadow_pages(address sp) {
 }
 
-inline void os::dll_unload(void *lib) {
-  ::dlclose(lib);
-}
-
-inline const int os::default_file_open_flags() { return 0;}
-
-inline jlong os::lseek(int fd, jlong offset, int whence) {
-  return (jlong) ::lseek64(fd, offset, whence);
-}
-
-inline int os::fsync(int fd) {
-  return ::fsync(fd);
-}
-
-inline int os::ftruncate(int fd, jlong length) {
-  return ::ftruncate64(fd, length);
-}
-
-// We don't have NUMA support on Aix, but we need this for compilation.
-inline bool os::numa_has_static_binding()   { ShouldNotReachHere(); return true; }
-inline bool os::numa_has_group_homing()     { ShouldNotReachHere(); return false;  }
-
-inline size_t os::restartable_read(int fd, void *buf, unsigned int nBytes) {
-  size_t res;
-  RESTARTABLE( (size_t) ::read(fd, buf, (size_t) nBytes), res);
-  return res;
-}
-
-inline size_t os::write(int fd, const void *buf, unsigned int nBytes) {
-  size_t res;
-  RESTARTABLE((size_t) ::write(fd, buf, (size_t) nBytes), res);
-  return res;
-}
-
-inline int os::socket_close(int fd) {
-  return ::close(fd);
-}
-
-inline int os::socket(int domain, int type, int protocol) {
-  return ::socket(domain, type, protocol);
-}
-
-inline int os::recv(int fd, char* buf, size_t nBytes, uint flags) {
-  RESTARTABLE_RETURN_INT(::recv(fd, buf, nBytes, flags));
-}
-
-inline int os::send(int fd, char* buf, size_t nBytes, uint flags) {
-  RESTARTABLE_RETURN_INT(::send(fd, buf, nBytes, flags));
-}
-
-inline int os::raw_send(int fd, char *buf, size_t nBytes, uint flags) {
-  return os::send(fd, buf, nBytes, flags);
-}
-
-inline int os::connect(int fd, struct sockaddr *him, socklen_t len) {
-  RESTARTABLE_RETURN_INT(::connect(fd, him, len));
-}
-
-inline struct hostent* os::get_host_by_name(char* name) {
-  return ::gethostbyname(name);
-}
-
-inline bool os::supports_monotonic_clock() {
-  // mread_real_time() is monotonic on AIX (see os::javaTimeNanos() comments)
-  return true;
-}
-
-inline void os::exit(int num) {
-  ::exit(num);
-}
-
-#endif // OS_AIX_VM_OS_AIX_INLINE_HPP
+#endif // OS_AIX_OS_AIX_INLINE_HPP

@@ -22,9 +22,10 @@
  *
  */
 
-#ifndef SHARE_VM_RUNTIME_OS_HPP
-#define SHARE_VM_RUNTIME_OS_HPP
+#ifndef SHARE_RUNTIME_OS_HPP
+#define SHARE_RUNTIME_OS_HPP
 
+#include "jvm_md.h"
 #include "jvm.h"
 #include "jvmtifiles/jvmti.h"
 #include "metaprogramming/isRegisteredEnum.hpp"

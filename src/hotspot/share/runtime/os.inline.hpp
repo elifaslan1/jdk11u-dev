@@ -22,8 +22,8 @@
  *
  */
 
-#ifndef SHARE_VM_RUNTIME_OS_INLINE_HPP
-#define SHARE_VM_RUNTIME_OS_INLINE_HPP
+#ifndef SHARE_RUNTIME_OS_INLINE_HPP
+#define SHARE_RUNTIME_OS_INLINE_HPP
 
 #include "runtime/os.hpp"
 
