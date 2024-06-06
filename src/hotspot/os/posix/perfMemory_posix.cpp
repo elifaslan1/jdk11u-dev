@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2001, 2018, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2012, 2018 SAP SE. All rights reserved.
+ * Copyright (c) 2001, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2020 SAP SE. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -29,7 +29,7 @@
 #include "memory/allocation.inline.hpp"
 #include "memory/resourceArea.hpp"
 #include "oops/oop.inline.hpp"
-#include "os_aix.inline.hpp"
+#include "os_posix.inline.hpp"
 #include "runtime/handles.inline.hpp"
 #include "runtime/os.hpp"
 #include "runtime/perfMemory.hpp"
@@ -42,6 +42,7 @@
 # include <errno.h>
 # include <stdio.h>
 # include <unistd.h>
+# include <sys/file.h>
 # include <sys/stat.h>
 # include <signal.h>
 # include <pwd.h>
@@ -86,8 +87,8 @@ static void save_memory_to_file(char* addr, size_t size) {
 
   int result;
 
-  RESTARTABLE(::open(destfile, O_CREAT|O_WRONLY|O_TRUNC, S_IREAD|S_IWRITE),
-              result);;
+  RESTARTABLE(os::open(destfile, O_CREAT|O_WRONLY|O_TRUNC, S_IRUSR|S_IWUSR),
+              result);
   if (result == OS_ERR) {
     if (PrintMiscellaneous && Verbose) {
       warning("Could not create Perfdata save file: %s: %s\n",
@@ -124,25 +125,32 @@ static void save_memory_to_file(char* addr, size_t size) {
 
 // Shared Memory Implementation Details
 
-// Note: the solaris and linux shared memory implementation uses the mmap
+// Note: the Posix shared memory implementation uses the mmap
 // interface with a backing store file to implement named shared memory.
 // Using the file system as the name space for shared memory allows a
 // common name space to be supported across a variety of platforms. It
 // also provides a name space that Java applications can deal with through
 // simple file apis.
 //
-// The solaris and linux implementations store the backing store file in
-// a user specific temporary directory located in the /tmp file system,
-// which is always a local file system and is sometimes a RAM based file
-// system.
 
 // return the user specific temporary directory name.
-//
 // the caller is expected to free the allocated memory.
 //
-static char* get_user_tmp_dir(const char* user) {
+#define TMP_BUFFER_LEN (4+22)
+static char* get_user_tmp_dir(const char* user, int vmid, int nspid) {
+  char* tmpdir = (char *)os::get_temp_directory();
+#if defined(LINUX)
+  // On linux, if containerized process, get dirname of
+  // /proc/{vmid}/root/tmp/{PERFDATA_NAME_user}
+  // otherwise /tmp/{PERFDATA_NAME_user}
+  char buffer[TMP_BUFFER_LEN];
+  assert(strlen(tmpdir) == 4, "No longer using /tmp - update buffer size");
 
-  const char* tmpdir = os::get_temp_directory();
+  if (nspid != -1) {
+    jio_snprintf(buffer, TMP_BUFFER_LEN, "/proc/%d/root%s", vmid, tmpdir);
+    tmpdir = buffer;
+  }
+#endif
   const char* perfdir = PERFDATA_NAME;
   size_t nbytes = strlen(tmpdir) + strlen(perfdir) + strlen(user) + 3;
   char* dirname = NEW_C_HEAP_ARRAY(char, nbytes, mtInternal);
@@ -186,6 +194,7 @@ static pid_t filename_to_pid(const char* filename) {
   // successful conversion, return the pid
   return pid;
 }
+
 
 // Check if the given statbuf is considered a secure directory for
 // the backing store files. Returns true if the directory is considered
@@ -236,11 +245,12 @@ static bool is_directory_secure(const char* path) {
   return is_statbuf_secure(&statbuf);
 }
 
-// (Taken over from Solaris to support the O_NOFOLLOW case on AIX.)
+
 // Check if the given directory file descriptor is considered a secure
 // directory for the backing store files. Returns true if the directory
 // exists and is considered a secure location. Returns false if the path
 // is a symbolic link or if an error occurred.
+//
 static bool is_dirfd_secure(int dir_fd) {
   struct stat statbuf;
   int result = 0;
@@ -256,6 +266,7 @@ static bool is_dirfd_secure(int dir_fd) {
 
 
 // Check to make sure fd1 and fd2 are referencing the same file system object.
+//
 static bool is_same_fsobject(int fd1, int fd2) {
   struct stat statbuf1;
   struct stat statbuf2;
@@ -278,91 +289,10 @@ static bool is_same_fsobject(int fd1, int fd2) {
   }
 }
 
-// Helper functions for open without O_NOFOLLOW which is not present on AIX 5.3/6.1.
-// We use the jdk6 implementation here.
-#ifndef O_NOFOLLOW
-// The O_NOFOLLOW oflag doesn't exist before solaris 5.10, this is to simulate that behaviour
-// was done in jdk 5/6 hotspot by Oracle this way
-static int open_o_nofollow_impl(const char* path, int oflag, mode_t mode, bool use_mode) {
-  struct stat orig_st;
-  struct stat new_st;
-  bool create;
-  int error;
-  int fd;
-  int result;
-
-  create = false;
-
-  RESTARTABLE(::lstat(path, &orig_st), result);
-
-  if (result == OS_ERR) {
-    if (errno == ENOENT && (oflag & O_CREAT) != 0) {
-      // File doesn't exist, but_we want to create it, add O_EXCL flag
-      // to make sure no-one creates it (or a symlink) before us
-      // This works as we expect with symlinks, from posix man page:
-      // 'If O_EXCL  and  O_CREAT  are set, and path names a symbolic
-      // link, open() shall fail and set errno to [EEXIST]'.
-      oflag |= O_EXCL;
-      create = true;
-    } else {
-      // File doesn't exist, and we are not creating it.
-      return OS_ERR;
-    }
-  } else {
-    // lstat success, check if existing file is a link.
-    if ((orig_st.st_mode & S_IFMT) == S_IFLNK)  {
-      // File is a symlink.
-      errno = ELOOP;
-      return OS_ERR;
-    }
-  }
-
-  if (use_mode == true) {
-    RESTARTABLE(::open(path, oflag, mode), fd);
-  } else {
-    RESTARTABLE(::open(path, oflag), fd);
-  }
-
-  if (fd == OS_ERR) {
-    return fd;
-  }
-
-  // Can't do inode checks on before/after if we created the file.
-  if (create == false) {
-    RESTARTABLE(::fstat(fd, &new_st), result);
-    if (result == OS_ERR) {
-      // Keep errno from fstat, in case close also fails.
-      error = errno;
-      ::close(fd);
-      errno = error;
-      return OS_ERR;
-    }
-
-    if (orig_st.st_dev != new_st.st_dev || orig_st.st_ino != new_st.st_ino) {
-      // File was tampered with during race window.
-      ::close(fd);
-      errno = EEXIST;
-      if (PrintMiscellaneous && Verbose) {
-        warning("possible file tampering attempt detected when opening %s", path);
-      }
-      return OS_ERR;
-    }
-  }
-
-  return fd;
-}
-
-static int open_o_nofollow(const char* path, int oflag, mode_t mode) {
-  return open_o_nofollow_impl(path, oflag, mode, true);
-}
-
-static int open_o_nofollow(const char* path, int oflag) {
-  return open_o_nofollow_impl(path, oflag, 0, false);
-}
-#endif
 
 // Open the directory of the given path and validate it.
 // Return a DIR * of the open directory.
+//
 static DIR *open_directory_secure(const char* dirname) {
   // Open the directory using open() so that it can be verified
   // to be secure by calling is_dirfd_secure(), opendir() and then check
@@ -371,16 +301,7 @@ static DIR *open_directory_secure(const char* dirname) {
   // calling opendir() and is_directory_secure() does.
   int result;
   DIR *dirp = NULL;
-
-  // No O_NOFOLLOW defined at buildtime, and it is not documented for open;
-  // so provide a workaround in this case.
-#ifdef O_NOFOLLOW
   RESTARTABLE(::open(dirname, O_RDONLY|O_NOFOLLOW), result);
-#else
-  // workaround (jdk6 coding)
-  result = open_o_nofollow(dirname, O_RDONLY);
-#endif
-
   if (result == OS_ERR) {
     // Directory doesn't exist or is a symlink, so there is nothing to cleanup.
     if (PrintMiscellaneous && Verbose) {
@@ -410,7 +331,7 @@ static DIR *open_directory_secure(const char* dirname) {
   }
 
   // Check to make sure fd and dirp are referencing the same file system object.
-  if (!is_same_fsobject(fd, dirp->dd_fd)) {
+  if (!is_same_fsobject(fd, AIX_ONLY(dirp->dd_fd) NOT_AIX(dirfd(dirp)))) {
     // The directory is not secure.
     os::close(fd);
     os::closedir(dirp);
@@ -442,7 +363,7 @@ static DIR *open_directory_secure_cwd(const char* dirname, int *saved_cwd_fd) {
     // Directory doesn't exist or is insecure, so there is nothing to cleanup.
     return dirp;
   }
-  int fd = dirp->dd_fd;
+  int fd = AIX_ONLY(dirp->dd_fd) NOT_AIX(dirfd(dirp));
 
   // Open a fd to the cwd and save it off.
   int result;
@@ -488,6 +409,7 @@ static void close_directory_secure_cwd(DIR* dirp, int saved_cwd_fd) {
 }
 
 // Check if the given file descriptor is considered a secure.
+//
 static bool is_file_secure(int fd, const char *filename) {
 
   int result;
@@ -511,9 +433,11 @@ static bool is_file_secure(int fd, const char *filename) {
   return true;
 }
 
-// Return the user name for the given user id.
+
+// return the user name for the given user id
 //
-// The caller is expected to free the allocated memory.
+// the caller is expected to free the allocated memory.
+//
 static char* get_user_name(uid_t uid) {
 
   struct passwd pwent;
@@ -526,7 +450,7 @@ static char* get_user_name(uid_t uid) {
 
   char* pwbuf = NEW_C_HEAP_ARRAY(char, bufsize, mtInternal);
 
-  struct passwd* p = NULL;
+  struct passwd* p;
   int result = getpwuid_r(uid, &pwent, pwbuf, (size_t)bufsize, &p);
 
   if (result != 0 || p == NULL || p->pw_name == NULL || *(p->pw_name) == '\0') {
@@ -574,7 +498,8 @@ static char* get_user_name(uid_t uid) {
 //
 // the caller is expected to free the allocated memory.
 //
-static char* get_user_name_slow(int vmid, TRAPS) {
+//
+static char* get_user_name_slow(int vmid, int nspid, TRAPS) {
 
   // short circuit the directory search if the process doesn't even exist.
   if (kill(vmid, 0) == OS_ERR) {
@@ -590,17 +515,35 @@ static char* get_user_name_slow(int vmid, TRAPS) {
   // directory search
   char* oldest_user = NULL;
   time_t oldest_ctime = 0;
+  int searchpid;
+  char* tmpdirname = (char *)os::get_temp_directory();
+#if defined(LINUX)
+  assert(strlen(tmpdirname) == 4, "No longer using /tmp - update buffer size");
 
-  const char* tmpdirname = os::get_temp_directory();
+  // On Linux, if nspid != -1, look in /proc/{vmid}/root/tmp for directories
+  // containing nspid, otherwise just look for vmid in /tmp.
+  if (nspid == -1) {
+    searchpid = vmid;
+  } else {
+    char buffer[MAXPATHLEN + 1];
+    jio_snprintf(buffer, MAXPATHLEN, "/proc/%d/root%s", vmid, tmpdirname);
+    tmpdirname = buffer;
+    searchpid = nspid;
+  }
+#else
+  searchpid = vmid;
+#endif
 
+  // open the temp directory
   DIR* tmpdirp = os::opendir(tmpdirname);
 
   if (tmpdirp == NULL) {
+    // Cannot open the directory to get the user name, return.
     return NULL;
   }
 
   // for each entry in the directory that matches the pattern hsperfdata_*,
-  // open the directory and check if the file for the given vmid exists.
+  // open the directory and check if the file for the given vmid (or nspid) exists.
   // The file with the expected name and the latest creation date is used
   // to determine the user name for the process id.
   //
@@ -614,12 +557,13 @@ static char* get_user_name_slow(int vmid, TRAPS) {
     }
 
     char* usrdir_name = NEW_C_HEAP_ARRAY(char,
-                              strlen(tmpdirname) + strlen(dentry->d_name) + 2, mtInternal);
+                                         strlen(tmpdirname) + strlen(dentry->d_name) + 2,
+                                         mtInternal);
     strcpy(usrdir_name, tmpdirname);
     strcat(usrdir_name, "/");
     strcat(usrdir_name, dentry->d_name);
 
-    // Open the user directory.
+    // open the user directory
     DIR* subdirp = open_directory_secure(usrdir_name);
 
     if (subdirp == NULL) {
@@ -643,12 +587,13 @@ static char* get_user_name_slow(int vmid, TRAPS) {
     errno = 0;
     while ((udentry = os::readdir(subdirp)) != NULL) {
 
-      if (filename_to_pid(udentry->d_name) == vmid) {
+      if (filename_to_pid(udentry->d_name) == searchpid) {
         struct stat statbuf;
         int result;
 
         char* filename = NEW_C_HEAP_ARRAY(char,
-                            strlen(usrdir_name) + strlen(udentry->d_name) + 2, mtInternal);
+                                          strlen(usrdir_name) + strlen(udentry->d_name) + 2,
+                                          mtInternal);
 
         strcpy(filename, usrdir_name);
         strcat(filename, "/");
@@ -694,8 +639,19 @@ static char* get_user_name_slow(int vmid, TRAPS) {
 
 // return the name of the user that owns the JVM indicated by the given vmid.
 //
-static char* get_user_name(int vmid, TRAPS) {
-  return get_user_name_slow(vmid, THREAD);
+static char* get_user_name(int vmid, int *nspid, TRAPS) {
+  char *result = get_user_name_slow(vmid, *nspid, THREAD);
+
+#if defined(LINUX)
+  // If we are examining a container process without PID namespaces enabled
+  // we need to use /proc/{pid}/root/tmp to find hsperfdata files.
+  if (result == NULL) {
+    result = get_user_name_slow(vmid, vmid, THREAD);
+    // Enable nspid logic going forward
+    if (result != NULL) *nspid = vmid;
+  }
+#endif
+  return result;
 }
 
 // return the file name of the backing store file for the named
@@ -703,13 +659,15 @@ static char* get_user_name(int vmid, TRAPS) {
 //
 // the caller is expected to free the allocated memory.
 //
-static char* get_sharedmem_filename(const char* dirname, int vmid) {
+static char* get_sharedmem_filename(const char* dirname, int vmid, int nspid) {
+
+  int pid = LINUX_ONLY((nspid == -1) ? vmid : nspid) NOT_LINUX(vmid);
 
   // add 2 for the file separator and a null terminator.
   size_t nbytes = strlen(dirname) + UINT_CHARS + 2;
 
   char* name = NEW_C_HEAP_ARRAY(char, nbytes, mtInternal);
-  snprintf(name, nbytes, "%s/%d", dirname, vmid);
+  snprintf(name, nbytes, "%s/%d", dirname, pid);
 
   return name;
 }
@@ -737,7 +695,8 @@ static void remove_file(const char* path) {
   }
 }
 
-// Cleanup stale shared memory files
+
+// cleanup stale shared memory files
 //
 // This method attempts to remove all stale shared memory files in
 // the named user temporary directory. It scans the named directory
@@ -745,13 +704,15 @@ static void remove_file(const char* path) {
 //
 // This directory should be used only by JVM processes owned by the
 // current user to store PerfMemory files. Any other files found
+// in this directory may be removed.
+//
 static void cleanup_sharedmem_files(const char* dirname) {
 
   int saved_cwd_fd;
-  // Open the directory.
+  // open the directory and set the current working directory to it
   DIR* dirp = open_directory_secure_cwd(dirname, &saved_cwd_fd);
   if (dirp == NULL) {
-     // Directory doesn't exist or is insecure, so there is nothing to cleanup.
+    // directory doesn't exist or is insecure, so there is nothing to cleanup
     return;
   }
 
@@ -761,6 +722,7 @@ static void cleanup_sharedmem_files(const char* dirname) {
   // terminate during this search and remove or create new files in this
   // directory. The behavior of this loop under these conditions is dependent
   // upon the implementation of opendir/readdir.
+  //
   struct dirent* entry;
   errno = 0;
   while ((entry = os::readdir(dirp)) != NULL) {
@@ -771,14 +733,47 @@ static void cleanup_sharedmem_files(const char* dirname) {
     if (pid == 0) {
 
       if (strcmp(filename, ".") != 0 && strcmp(filename, "..") != 0) {
-
-        // Attempt to remove all unexpected files, except "." and "..".
+        // attempt to remove all unexpected files, except "." and ".."
         unlink(filename);
       }
 
       errno = 0;
       continue;
     }
+
+    // Special case on Linux, if multiple containers share the
+    // same /tmp directory:
+    //
+    // - All the JVMs must have the JDK-8286030 fix, or the behavior
+    //   is undefined.
+    // - We cannot rely on the values of the pid, because it could
+    //   be a process in a different namespace. We must use the flock
+    //   protocol to determine if a live process is using this file.
+    //   See create_sharedmem_file().
+    int fd;
+    RESTARTABLE(os::open(filename, O_RDONLY, 0), fd);
+    if (fd == OS_ERR) {
+      // Something wrong happened. Ignore the error and don't try to remove the
+      // file.
+      log_debug(perf, memops)("os::open() for stale file check failed for %s/%s", dirname, filename);
+      errno = 0;
+      continue;
+    }
+
+    int n;
+    RESTARTABLE(::flock(fd, LOCK_EX|LOCK_NB), n);
+    if (n != 0) {
+      // Either another process holds the exclusive lock on this file, or
+      // something wrong happened. Ignore the error and don't try to remove the
+      // file.
+      log_debug(perf, memops)("flock for stale file check failed for %s/%s", dirname, filename);
+      ::close(fd);
+      errno = 0;
+      continue;
+    }
+    // We are able to lock the file, but this file might have been created
+    // by an older JVM that doesn't use the flock prototol, so we must do
+    // the folowing checks (which are also done by older JVMs).
 
     // The following code assumes that pid must be in the same
     // namespace as the current process.
@@ -804,28 +799,35 @@ static void cleanup_sharedmem_files(const char* dirname) {
       unlink(filename);
     }
 
+    // Hold the lock until here to prevent other JVMs from using this file
+    // while we were in the middle of deleting it.
+    ::close(fd);
+
     errno = 0;
   }
 
-  // Close the directory and reset the current working directory.
+  // close the directory and reset the current working directory
   close_directory_secure_cwd(dirp, saved_cwd_fd);
 }
 
-// Make the user specific temporary directory. Returns true if
+// make the user specific temporary directory. Returns true if
 // the directory exists and is secure upon return. Returns false
 // if the directory exists but is either a symlink, is otherwise
 // insecure, or if an error occurred.
+//
 static bool make_user_tmp_dir(const char* dirname) {
 
-  // Create the directory with 0755 permissions. note that the directory
+  // create the directory with 0755 permissions. note that the directory
   // will be owned by euid::egid, which may not be the same as uid::gid.
+  //
   if (mkdir(dirname, S_IRWXU|S_IRGRP|S_IXGRP|S_IROTH|S_IXOTH) == OS_ERR) {
     if (errno == EEXIST) {
       // The directory already exists and was probably created by another
       // JVM instance. However, this could also be the result of a
       // deliberate symlink. Verify that the existing directory is safe.
+      //
       if (!is_directory_secure(dirname)) {
-        // Directory is not secure.
+        // directory is not secure
         if (PrintMiscellaneous && Verbose) {
           warning("%s directory is insecure\n", dirname);
         }
@@ -862,7 +864,7 @@ static int create_sharedmem_file(const char* dirname, const char* filename, size
   }
 
   int saved_cwd_fd;
-  // Open the directory and set the current working directory to it.
+  // open the directory and set the current working directory to it
   DIR* dirp = open_directory_secure_cwd(dirname, &saved_cwd_fd);
   if (dirp == NULL) {
     // Directory doesn't exist or is insecure, so cannot create shared
@@ -874,16 +876,7 @@ static int create_sharedmem_file(const char* dirname, const char* filename, size
   // Cannot use O_TRUNC here; truncation of an existing file has to happen
   // after the is_file_secure() check below.
   int result;
-
-  // No O_NOFOLLOW defined at buildtime, and it is not documented for open;
-  // so provide a workaround in this case.
-#ifdef O_NOFOLLOW
-  RESTARTABLE(::open(filename, O_RDWR|O_CREAT|O_NOFOLLOW, S_IREAD|S_IWRITE), result);
-#else
-  // workaround function (jdk6 code)
-  result = open_o_nofollow(filename, O_RDWR|O_CREAT, S_IREAD|S_IWRITE);
-#endif
-
+  RESTARTABLE(os::open(filename, O_RDWR|O_CREAT|O_NOFOLLOW, S_IRUSR|S_IWUSR), result);
   if (result == OS_ERR) {
     if (PrintMiscellaneous && Verbose) {
       if (errno == ELOOP) {
@@ -892,24 +885,48 @@ static int create_sharedmem_file(const char* dirname, const char* filename, size
         warning("could not create file %s: %s\n", filename, os::strerror(errno));
       }
     }
-    // Close the directory and reset the current working directory.
+    // close the directory and reset the current working directory
     close_directory_secure_cwd(dirp, saved_cwd_fd);
 
     return -1;
   }
-  // Close the directory and reset the current working directory.
+  // close the directory and reset the current working directory
   close_directory_secure_cwd(dirp, saved_cwd_fd);
 
   // save the file descriptor
   int fd = result;
 
-  // Check to see if the file is secure.
+  // check to see if the file is secure
   if (!is_file_secure(fd, filename)) {
     ::close(fd);
     return -1;
   }
 
-  // Truncate the file to get rid of any existing data.
+  // On Linux, different containerized processes that share the same /tmp
+  // directory (e.g., with "docker --volume ...") may have the same pid and
+  // try to use the same file. To avoid conflicts among such
+  // processes, we allow only one of them (the winner of the flock() call)
+  // to write to the file. All the other processes will give up and will
+  // have perfdata disabled.
+  //
+  // Note that the flock will be automatically given up when the winner
+  // process exits.
+  //
+  // The locking protocol works only with other JVMs that have the JDK-8286030
+  // fix. If you are sharing the /tmp difrectory among different containers,
+  // do not use older JVMs that don't have this fix, or the behavior is undefined.
+  int n;
+  RESTARTABLE(::flock(fd, LOCK_EX|LOCK_NB), n);
+  if (n != 0) {
+    log_warning(perf, memops)("Cannot use file %s/%s because %s (errno = %d)", dirname, filename,
+                              (errno == EWOULDBLOCK) ?
+                              "it is locked by another process" :
+                              "flock() failed", errno);
+    ::close(fd);
+    return -1;
+  }
+
+  // truncate the file to get rid of any existing data
   RESTARTABLE(::ftruncate(fd, (off_t)0), result);
   if (result == OS_ERR) {
     if (PrintMiscellaneous && Verbose) {
@@ -928,7 +945,28 @@ static int create_sharedmem_file(const char* dirname, const char* filename, size
     return -1;
   }
 
-  return fd;
+  // Verify that we have enough disk space for this file.
+  // We'll get random SIGBUS crashes on memory accesses if
+  // we don't.
+  for (size_t seekpos = 0; seekpos < size; seekpos += os::vm_page_size()) {
+    int zero_int = 0;
+    result = (int)os::seek_to_file_offset(fd, (jlong)(seekpos));
+    if (result == -1 ) break;
+    RESTARTABLE(::write(fd, &zero_int, 1), result);
+    if (result != 1) {
+      if (errno == ENOSPC) {
+        warning("Insufficient space for shared memory file:\n   %s\nTry using the -Djava.io.tmpdir= option to select an alternate temp location.\n", filename);
+      }
+      break;
+    }
+  }
+
+  if (result != -1) {
+    return fd;
+  } else {
+    ::close(fd);
+    return -1;
+  }
 }
 
 // open the shared memory file for the given user and vmid. returns
@@ -939,12 +977,7 @@ static int open_sharedmem_file(const char* filename, int oflags, TRAPS) {
 
   // open the file
   int result;
-  // provide a workaround in case no O_NOFOLLOW is defined at buildtime
-#ifdef O_NOFOLLOW
-  RESTARTABLE(::open(filename, oflags), result);
-#else
-  result = open_o_nofollow(filename, oflags);
-#endif
+  RESTARTABLE(os::open(filename, oflags, 0), result);
   if (result == OS_ERR) {
     if (errno == ENOENT) {
       THROW_MSG_(vmSymbols::java_lang_IllegalArgumentException(),
@@ -961,7 +994,7 @@ static int open_sharedmem_file(const char* filename, int oflags, TRAPS) {
   }
   int fd = result;
 
-  // Check to see if the file is secure.
+  // check to see if the file is secure
   if (!is_file_secure(fd, filename)) {
     ::close(fd);
     return -1;
@@ -974,8 +1007,7 @@ static int open_sharedmem_file(const char* filename, int oflags, TRAPS) {
 // memory region on success or NULL on failure. A return value of
 // NULL will ultimately disable the shared memory feature.
 //
-// On AIX, the name space for shared memory objects
-// is the file system name space.
+// The name space for shared memory objects is the file system name space.
 //
 // A monitoring application attaching to a JVM does not need to know
 // the file system name of the shared memory object. However, it may
@@ -996,10 +1028,10 @@ static char* mmap_create_shared(size_t size) {
   if (user_name == NULL)
     return NULL;
 
-  char* dirname = get_user_tmp_dir(user_name);
-  char* filename = get_sharedmem_filename(dirname, vmid);
+  char* dirname = get_user_tmp_dir(user_name, vmid, -1);
+  char* filename = get_sharedmem_filename(dirname, vmid, -1);
 
-  // get the short filename.
+  // get the short filename
   char* short_filename = strrchr(filename, '/');
   if (short_filename == NULL) {
     short_filename = filename;
@@ -1044,8 +1076,8 @@ static char* mmap_create_shared(size_t size) {
   // clear the shared memory region
   (void)::memset((void*) mapAddress, 0, size);
 
-  // It does not go through os api, the operation has to record from here.
-  MemTracker::record_virtual_memory_reserve((address)mapAddress, size, CURRENT_PC, mtInternal);
+  // it does not go through os api, the operation has to record from here
+  MemTracker::record_virtual_memory_reserve_and_commit((address)mapAddress, size, CURRENT_PC, mtInternal);
 
   log_info(perf, memops)("Successfully opened");
 
@@ -1055,11 +1087,15 @@ static char* mmap_create_shared(size_t size) {
 // release a named shared memory region
 //
 static void unmap_shared(char* addr, size_t bytes) {
+#if defined(_AIX)
   // Do not rely on os::reserve_memory/os::release_memory to use mmap.
   // Use os::reserve_memory/os::release_memory for PerfDisableSharedMem=1, mmap/munmap for PerfDisableSharedMem=0
   if (::munmap(addr, bytes) == -1) {
     warning("perfmemory: munmap failed (%d)\n", errno);
   }
+#else
+  os::release_memory(addr, bytes);
+#endif
 }
 
 // create the PerfData memory region in shared memory.
@@ -1135,12 +1171,7 @@ static void mmap_attach_shared(const char* user, int vmid, PerfMemory::PerfMemor
   // constructs for the file and the shared memory mapping.
   if (mode == PerfMemory::PERF_MODE_RO) {
     mmap_prot = PROT_READ;
-  // No O_NOFOLLOW defined at buildtime, and it is not documented for open.
-#ifdef O_NOFOLLOW
     file_flags = O_RDONLY | O_NOFOLLOW;
-#else
-    file_flags = O_RDONLY;
-#endif
   }
   else if (mode == PerfMemory::PERF_MODE_RW) {
 #ifdef LATER
@@ -1156,8 +1187,11 @@ static void mmap_attach_shared(const char* user, int vmid, PerfMemory::PerfMemor
               "Illegal access mode");
   }
 
+  // for linux, determine if vmid is for a containerized process
+  int nspid = LINUX_ONLY(os::Linux::get_namespace_pid(vmid)) NOT_LINUX(-1);
+
   if (user == NULL || strlen(user) == 0) {
-    luser = get_user_name(vmid, CHECK);
+    luser = get_user_name(vmid, &nspid, CHECK);
   }
   else {
     luser = user;
@@ -1168,7 +1202,7 @@ static void mmap_attach_shared(const char* user, int vmid, PerfMemory::PerfMemor
               "Could not map vmid to user Name");
   }
 
-  char* dirname = get_user_tmp_dir(luser);
+  char* dirname = get_user_tmp_dir(luser, vmid, nspid);
 
   // since we don't follow symbolic links when creating the backing
   // store file, we don't follow them when attaching either.
@@ -1182,7 +1216,7 @@ static void mmap_attach_shared(const char* user, int vmid, PerfMemory::PerfMemor
               "Process not found");
   }
 
-  char* filename = get_sharedmem_filename(dirname, vmid);
+  char* filename = get_sharedmem_filename(dirname, vmid, nspid);
 
   // copy heap memory to resource memory. the open_sharedmem_file
   // method below need to use the filename, but could throw an
@@ -1229,8 +1263,8 @@ static void mmap_attach_shared(const char* user, int vmid, PerfMemory::PerfMemor
               "Could not map PerfMemory");
   }
 
-  // it does not go through os api, the operation has to record from here.
-  MemTracker::record_virtual_memory_reserve((address)mapAddress, size, CURRENT_PC, mtInternal);
+  // it does not go through os api, the operation has to record from here
+  MemTracker::record_virtual_memory_reserve_and_commit((address)mapAddress, size, CURRENT_PC, mtInternal);
 
   *addr = mapAddress;
   *sizep = size;

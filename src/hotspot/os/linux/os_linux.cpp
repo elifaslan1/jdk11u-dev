@@ -5233,245 +5233,35 @@ jlong os::Linux::fast_thread_cpu_time(clockid_t clockid) {
   return (tp.tv_sec * NANOSECS_PER_SEC) + tp.tv_nsec;
 }
 
-void os::Linux::initialize_os_info() {
-  assert(_os_version == 0, "OS info already initialized");
+// Determine if the vmid is the parent pid for a child in a PID namespace.
+// Return the namespace pid if so, otherwise -1.
+int os::Linux::get_namespace_pid(int vmid) {
+  char fname[24];
+  int retpid = -1;
 
-  struct utsname _uname;
+  snprintf(fname, sizeof(fname), "/proc/%d/status", vmid);
+  FILE *fp = fopen(fname, "r");
 
-  uint32_t major;
-  uint32_t minor;
-  uint32_t fix;
-
-  int rc;
-
-  // Kernel version is unknown if
-  // verification below fails.
-  _os_version = 0x01000000;
-
-  rc = uname(&_uname);
-  if (rc != -1) {
-
-    rc = sscanf(_uname.release,"%d.%d.%d", &major, &minor, &fix);
-    if (rc == 3) {
-
-      if (major < 256 && minor < 256 && fix < 256) {
-        // Kernel version format is as expected,
-        // set it overriding unknown state.
-        _os_version = (major << 16) |
-                      (minor << 8 ) |
-                      (fix   << 0 ) ;
+  if (fp) {
+    int pid, nspid;
+    int ret;
+    while (!feof(fp) && !ferror(fp)) {
+      ret = fscanf(fp, "NSpid: %d %d", &pid, &nspid);
+      if (ret == 1) {
+        break;
+      }
+      if (ret == 2) {
+        retpid = nspid;
+        break;
+      }
+      for (;;) {
+        int ch = fgetc(fp);
+        if (ch == EOF || ch == (int)'\n') break;
       }
     }
+    fclose(fp);
   }
-}
-
-uint32_t os::Linux::os_version() {
-  assert(_os_version != 0, "not initialized");
-  return _os_version & 0x00FFFFFF;
-}
-
-bool os::Linux::os_version_is_known() {
-  assert(_os_version != 0, "not initialized");
-  return _os_version & 0x01000000 ? false : true;
-}
-
-/////
-// glibc on Linux platform uses non-documented flag
-// to indicate, that some special sort of signal
-// trampoline is used.
-// We will never set this flag, and we should
-// ignore this flag in our diagnostic
-#ifdef SIGNIFICANT_SIGNAL_MASK
-  #undef SIGNIFICANT_SIGNAL_MASK
-#endif
-#define SIGNIFICANT_SIGNAL_MASK (~0x04000000)
-
-static const char* get_signal_handler_name(address handler,
-                                           char* buf, int buflen) {
-  int offset = 0;
-  bool found = os::dll_address_to_library_name(handler, buf, buflen, &offset);
-  if (found) {
-    // skip directory names
-    const char *p1, *p2;
-    p1 = buf;
-    size_t len = strlen(os::file_separator());
-    while ((p2 = strstr(p1, os::file_separator())) != NULL) p1 = p2 + len;
-    jio_snprintf(buf, buflen, "%s+0x%x", p1, offset);
-  } else {
-    jio_snprintf(buf, buflen, PTR_FORMAT, handler);
-  }
-  return buf;
-}
-
-static void print_signal_handler(outputStream* st, int sig,
-                                 char* buf, size_t buflen) {
-  struct sigaction sa;
-
-  sigaction(sig, NULL, &sa);
-
-  // See comment for SIGNIFICANT_SIGNAL_MASK define
-  sa.sa_flags &= SIGNIFICANT_SIGNAL_MASK;
-
-  st->print("%s: ", os::exception_name(sig, buf, buflen));
-
-  address handler = (sa.sa_flags & SA_SIGINFO)
-    ? CAST_FROM_FN_PTR(address, sa.sa_sigaction)
-    : CAST_FROM_FN_PTR(address, sa.sa_handler);
-
-  if (handler == CAST_FROM_FN_PTR(address, SIG_DFL)) {
-    st->print("SIG_DFL");
-  } else if (handler == CAST_FROM_FN_PTR(address, SIG_IGN)) {
-    st->print("SIG_IGN");
-  } else {
-    st->print("[%s]", get_signal_handler_name(handler, buf, buflen));
-  }
-
-  st->print(", sa_mask[0]=");
-  os::Posix::print_signal_set_short(st, &sa.sa_mask);
-
-  address rh = VMError::get_resetted_sighandler(sig);
-  // May be, handler was resetted by VMError?
-  if (rh != NULL) {
-    handler = rh;
-    sa.sa_flags = VMError::get_resetted_sigflags(sig) & SIGNIFICANT_SIGNAL_MASK;
-  }
-
-  st->print(", sa_flags=");
-  os::Posix::print_sa_flags(st, sa.sa_flags);
-
-  // Check: is it our handler?
-  if (handler == CAST_FROM_FN_PTR(address, (sa_sigaction_t)signalHandler) ||
-      handler == CAST_FROM_FN_PTR(address, (sa_sigaction_t)SR_handler)) {
-    // It is our signal handler
-    // check for flags, reset system-used one!
-    if ((int)sa.sa_flags != os::Linux::get_our_sigflags(sig)) {
-      st->print(
-                ", flags was changed from " PTR32_FORMAT ", consider using jsig library",
-                os::Linux::get_our_sigflags(sig));
-    }
-  }
-  st->cr();
-}
-
-
-#define DO_SIGNAL_CHECK(sig)                      \
-  do {                                            \
-    if (!sigismember(&check_signal_done, sig)) {  \
-      os::Linux::check_signal_handler(sig);       \
-    }                                             \
-  } while (0)
-
-// This method is a periodic task to check for misbehaving JNI applications
-// under CheckJNI, we can add any periodic checks here
-
-void os::run_periodic_checks() {
-  if (check_signals == false) return;
-
-  // SEGV and BUS if overridden could potentially prevent
-  // generation of hs*.log in the event of a crash, debugging
-  // such a case can be very challenging, so we absolutely
-  // check the following for a good measure:
-  DO_SIGNAL_CHECK(SIGSEGV);
-  DO_SIGNAL_CHECK(SIGILL);
-  DO_SIGNAL_CHECK(SIGFPE);
-  DO_SIGNAL_CHECK(SIGBUS);
-  DO_SIGNAL_CHECK(SIGPIPE);
-  DO_SIGNAL_CHECK(SIGXFSZ);
-#if defined(PPC64)
-  DO_SIGNAL_CHECK(SIGTRAP);
-#endif
-
-  // ReduceSignalUsage allows the user to override these handlers
-  // see comments at the very top and jvm_md.h
-  if (!ReduceSignalUsage) {
-    DO_SIGNAL_CHECK(SHUTDOWN1_SIGNAL);
-    DO_SIGNAL_CHECK(SHUTDOWN2_SIGNAL);
-    DO_SIGNAL_CHECK(SHUTDOWN3_SIGNAL);
-    DO_SIGNAL_CHECK(BREAK_SIGNAL);
-  }
-
-  DO_SIGNAL_CHECK(SR_signum);
-}
-
-typedef int (*os_sigaction_t)(int, const struct sigaction *, struct sigaction *);
-
-static os_sigaction_t os_sigaction = NULL;
-
-void os::Linux::check_signal_handler(int sig) {
-  char buf[O_BUFLEN];
-  address jvmHandler = NULL;
-
-
-  struct sigaction act;
-  if (os_sigaction == NULL) {
-    // only trust the default sigaction, in case it has been interposed
-    os_sigaction = (os_sigaction_t)dlsym(RTLD_DEFAULT, "sigaction");
-    if (os_sigaction == NULL) return;
-  }
-
-  os_sigaction(sig, (struct sigaction*)NULL, &act);
-
-
-  act.sa_flags &= SIGNIFICANT_SIGNAL_MASK;
-
-  address thisHandler = (act.sa_flags & SA_SIGINFO)
-    ? CAST_FROM_FN_PTR(address, act.sa_sigaction)
-    : CAST_FROM_FN_PTR(address, act.sa_handler);
-
-
-  switch (sig) {
-  case SIGSEGV:
-  case SIGBUS:
-  case SIGFPE:
-  case SIGPIPE:
-  case SIGILL:
-  case SIGXFSZ:
-    jvmHandler = CAST_FROM_FN_PTR(address, (sa_sigaction_t)signalHandler);
-    break;
-
-  case SHUTDOWN1_SIGNAL:
-  case SHUTDOWN2_SIGNAL:
-  case SHUTDOWN3_SIGNAL:
-  case BREAK_SIGNAL:
-    jvmHandler = (address)user_handler();
-    break;
-
-  default:
-    if (sig == SR_signum) {
-      jvmHandler = CAST_FROM_FN_PTR(address, (sa_sigaction_t)SR_handler);
-    } else {
-      return;
-    }
-    break;
-  }
-
-  if (thisHandler != jvmHandler) {
-    tty->print("Warning: %s handler ", exception_name(sig, buf, O_BUFLEN));
-    tty->print("expected:%s", get_signal_handler_name(jvmHandler, buf, O_BUFLEN));
-    tty->print_cr("  found:%s", get_signal_handler_name(thisHandler, buf, O_BUFLEN));
-    // No need to check this sig any longer
-    sigaddset(&check_signal_done, sig);
-    // Running under non-interactive shell, SHUTDOWN2_SIGNAL will be reassigned SIG_IGN
-    if (sig == SHUTDOWN2_SIGNAL && !isatty(fileno(stdin))) {
-      tty->print_cr("Running in non-interactive shell, %s handler is replaced by shell",
-                    exception_name(sig, buf, O_BUFLEN));
-    }
-  } else if(os::Linux::get_our_sigflags(sig) != 0 && (int)act.sa_flags != os::Linux::get_our_sigflags(sig)) {
-    tty->print("Warning: %s handler flags ", exception_name(sig, buf, O_BUFLEN));
-    tty->print("expected:");
-    os::Posix::print_sa_flags(tty, os::Linux::get_our_sigflags(sig));
-    tty->cr();
-    tty->print("  found:");
-    os::Posix::print_sa_flags(tty, act.sa_flags);
-    tty->cr();
-    // No need to check this sig any longer
-    sigaddset(&check_signal_done, sig);
-  }
-
-  // Dump all the signal
-  if (sigismember(&check_signal_done, sig)) {
-    print_signal_handlers(tty, buf, O_BUFLEN);
-  }
+  return retpid;
 }
 
 extern void report_error(char* file_name, int line_no, char* title,
