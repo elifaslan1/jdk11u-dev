@@ -28,6 +28,7 @@
 #include "runtime/os.hpp"
 #include "runtime/thread.hpp"
 
+<<<<<<< HEAD
 inline const char* os::dll_file_extension()            { return ".dll"; }
 
 inline const int os::default_file_open_flags() { return O_BINARY | O_NOINHERIT;}
@@ -49,6 +50,8 @@ inline bool os::obsolete_option(const JavaVMOption *option) {
   return false;
 }
 
+=======
+>>>>>>> 33b6378f1e8 (8265101: Remove unnecessary functions in os*.inline.hpp)
 inline bool os::uses_stack_guard_pages() {
   return true;
 }
@@ -74,28 +77,42 @@ inline void os::map_stack_shadow_pages(address sp) {
 inline bool os::numa_has_static_binding()   { return true;   }
 inline bool os::numa_has_group_homing()     { return false;  }
 
-inline size_t os::read(int fd, void *buf, unsigned int nBytes) {
-  return ::read(fd, buf, nBytes);
+// Platform Mutex/Monitor implementation
+
+inline os::PlatformMutex::PlatformMutex() {
+  InitializeCriticalSection(&_mutex);
 }
 
-inline size_t os::restartable_read(int fd, void *buf, unsigned int nBytes) {
-  return ::read(fd, buf, nBytes);
+inline os::PlatformMutex::~PlatformMutex() {
+  DeleteCriticalSection(&_mutex);
 }
 
-inline size_t os::write(int fd, const void *buf, unsigned int nBytes) {
-  return ::write(fd, buf, nBytes);
+inline os::PlatformMonitor::PlatformMonitor() {
+  InitializeConditionVariable(&_cond);
 }
 
-inline int os::close(int fd) {
-  return ::close(fd);
+inline os::PlatformMonitor::~PlatformMonitor() {
+  // There is no DeleteConditionVariable API
 }
 
-inline bool os::supports_monotonic_clock() {
-  return true;
+inline void os::PlatformMutex::lock() {
+  EnterCriticalSection(&_mutex);
 }
 
-inline void os::exit(int num) {
-  win32::exit_process_or_thread(win32::EPT_PROCESS, num);
+inline void os::PlatformMutex::unlock() {
+  LeaveCriticalSection(&_mutex);
 }
 
-#endif // OS_WINDOWS_VM_OS_WINDOWS_INLINE_HPP
+inline bool os::PlatformMutex::try_lock() {
+  return TryEnterCriticalSection(&_mutex);
+}
+
+inline void os::PlatformMonitor::notify() {
+  WakeConditionVariable(&_cond);
+}
+
+inline void os::PlatformMonitor::notify_all() {
+  WakeAllConditionVariable(&_cond);
+}
+
+#endif // OS_WINDOWS_OS_WINDOWS_INLINE_HPP

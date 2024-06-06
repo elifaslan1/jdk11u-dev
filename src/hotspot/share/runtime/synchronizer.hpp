@@ -29,7 +29,7 @@
 #include "oops/markOop.hpp"
 #include "runtime/basicLock.hpp"
 #include "runtime/handles.hpp"
-#include "runtime/perfData.hpp"
+#include "utilities/growableArray.hpp"
 
 class ObjectMonitor;
 class ThreadsList;
