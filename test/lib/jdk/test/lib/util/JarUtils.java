@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2018, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -157,7 +157,7 @@ public final class JarUtils {
                 while (jentries.hasMoreElements()) {
                     JarEntry jentry = jentries.nextElement();
                     if (!names.contains(jentry.getName())) {
-                        jos.putNextEntry(jentry);
+                        jos.putNextEntry(copyEntry(jentry));
                         jf.getInputStream(jentry).transferTo(jos);
                     }
                 }
@@ -289,7 +289,7 @@ public final class JarUtils {
                         changes.remove(name);
                     } else {
                         System.out.println(String.format("- Copy %s", name));
-                        jos.putNextEntry(entry);
+                        jos.putNextEntry(copyEntry(entry));
                         srcJarFile.getInputStream(entry).transferTo(jos);
                     }
                 }
@@ -316,6 +316,57 @@ public final class JarUtils {
         ByteArrayOutputStream bout = new ByteArrayOutputStream();
         man.write(bout);
         updateJar(src, dest, Map.of(JarFile.MANIFEST_NAME, bout.toByteArray()));
+    }
+
+    /**
+     * Remove entries from a ZIP file.
+     *
+     * Each entry can be a name or a name ending with "*".
+     *
+     * @return number of removed entries
+     * @throws IOException if there is any I/O error
+     */
+    public static int deleteEntries(Path jarfile, String... patterns)
+            throws IOException {
+        Path tmpfile = Files.createTempFile("jar", "jar");
+        int count = 0;
+
+        try (OutputStream out = Files.newOutputStream(tmpfile);
+             JarOutputStream jos = new JarOutputStream(out)) {
+            try (JarFile jf = new JarFile(jarfile.toString())) {
+                Enumeration<JarEntry> jentries = jf.entries();
+                top: while (jentries.hasMoreElements()) {
+                    JarEntry jentry = jentries.nextElement();
+                    String name = jentry.getName();
+                    for (String pattern : patterns) {
+                        if (pattern.endsWith("*")) {
+                            if (name.startsWith(pattern.substring(
+                                    0, pattern.length() - 1))) {
+                                // Go directly to next entry. This
+                                // one is not written into `jos` and
+                                // therefore removed.
+                                count++;
+                                continue top;
+                            }
+                        } else {
+                            if (name.equals(pattern)) {
+                                // Same as above
+                                count++;
+                                continue top;
+                            }
+                        }
+                    }
+                    // No pattern matched, file retained
+                    jos.putNextEntry(copyEntry(jentry));
+                    jf.getInputStream(jentry).transferTo(jos);
+                }
+            }
+        }
+
+        // replace the original JAR file
+        Files.move(tmpfile, jarfile, StandardCopyOption.REPLACE_EXISTING);
+
+        return count;
     }
 
     private static void updateEntry(JarOutputStream jos, String name, Object content)
@@ -358,5 +409,18 @@ public final class JarUtils {
             }
         }
         return entries;
+    }
+
+    private static JarEntry copyEntry(JarEntry e1) {
+        JarEntry e2 = new JarEntry(e1.getName());
+        e2.setMethod(e1.getMethod());
+        e2.setTime(e1.getTime());
+        e2.setComment(e1.getComment());
+        e2.setExtra(e1.getExtra());
+        if (e1.getMethod() == JarEntry.STORED) {
+            e2.setSize(e1.getSize());
+            e2.setCrc(e1.getCrc());
+        }
+        return e2;
     }
 }
